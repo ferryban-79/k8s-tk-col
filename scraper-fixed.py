@@ -102,7 +102,20 @@ logger.add(LOG_FILE, level="DEBUG",
 # 4. Helpers
 # ---------------------------------------------------------
 def clean_filename(text):
-    return re.sub(r'[\/*?:"<>|]', "", text).replace("\n", " ").strip()[:50]
+    """
+    Produce a filename/folder-name safe string for BOTH local disk and Mega (rclone).
+    Mega rejects: emojis, non-ASCII unicode (🥲 シ …), hashtags, and many special chars.
+    Root cause of rclone 'Invalid arguments' error.
+    """
+    # 1. Remove hashtags entirely (stored in caption__.json anyway)
+    text = re.sub(r'#\w+', '', text)
+    # 2. Strip non-ASCII chars (emojis, CJK, Arabic, special unicode like … 🥲 シ)
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    # 3. Remove filesystem-unsafe chars
+    text = re.sub(r'[\/*?:"<>|\\]', '', text)
+    # 4. Collapse whitespace → single underscore, strip edges
+    text = re.sub(r'[\s_]+', '_', text).strip('_- ')
+    return text[:50] if text.strip() else "no_caption"
 
 def human_ts(unix_ts):
     if not unix_ts:
@@ -176,25 +189,20 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         return False
 
 # ---------------------------------------------------------
-# 6. YT-DLP — strict H.264 format
+# 6. YT-DLP — guaranteed H.264 (format_sort forces it, ffmpeg converts if needed)
 # ---------------------------------------------------------
 def download_with_ytdlp(url, output_path):
     ydl_opts = {
-        'outtmpl':            str(output_path),
-        'quiet':              True,
-        'no_warnings':        True,
-        'noprogress':         True,
-        'socket_timeout':     30,
-        # Strict H.264 — no HEVC/AV1 fallback
-        'format':             (
-            'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/'
-            'bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/'
-            'best[ext=mp4][vcodec^=avc]/'
-            'bestvideo[vcodec^=avc1]+bestaudio/'
-            'best[ext=mp4]'
-        ),
+        'outtmpl':             str(output_path),
+        'quiet':               True,
+        'no_warnings':         True,
+        'noprogress':          True,
+        'socket_timeout':      30,
+        # PRIMARY FIX: format_sort forces H.264/AVC selection before download
+        # This prevents yt-dlp from picking HEVC/AV1 which causes blank video
+        'format':              'bestvideo+bestaudio/best',
+        'format_sort':         ['vcodec:h264', 'ext:mp4', 'ext:m4a'],
         'merge_output_format': 'mp4',
-        'postprocessor_args':  ['-c:v', 'libx264', '-preset', 'fast'],
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -374,18 +382,46 @@ class TikTokScraperV5:
                 await self.download_file_httpx(
                     avatar_url, v_path / f"avatar__{file_prefix}.jpg", log_prefix, "Avatar")
 
-            # Photo carousel OR video
+            # Photo carousel OR video — DUAL APPROACH
             image_post = item.get("imagePost")
             if image_post and image_post.get("images"):
-                logger.info(f"{log_prefix} 📸 Carousel mode.")
-                for i, img in enumerate(image_post.get("images", [])):
-                    img_url = (img.get("imageURL", {}).get("urlList", [None])[0]
-                               or img.get("displayImage", {}).get("urlList", [None])[0])
+                images = image_post.get("images", [])
+                logger.info(f"{log_prefix} 📸 Carousel mode ({len(images)} images).")
+                failed_indices = []
+
+                # Pass 1: Direct httpx download for each image
+                for i, img in enumerate(images):
+                    img_url = (
+                        img.get("imageURL",    {}).get("urlList", [None])[0]
+                        or img.get("displayImage", {}).get("urlList", [None])[0]
+                    )
+                    img_path = v_path / f"carousel_{i+1:03d}__{file_prefix}.jpg"
                     if img_url:
-                        await self.download_file_httpx(
-                            img_url,
-                            v_path / f"carousel_{i+1:03d}__{file_prefix}.jpg",
-                            log_prefix, f"Carousel {i+1}")
+                        ok = await self.download_file_httpx(img_url, img_path, log_prefix, f"Carousel {i+1}")
+                        if not ok:
+                            failed_indices.append(i)
+                    else:
+                        failed_indices.append(i)
+
+                # Pass 2: yt-dlp fallback if any images failed
+                if failed_indices:
+                    logger.info(f"{log_prefix} 🔄 Carousel yt-dlp fallback for {len(failed_indices)} failed images...")
+                    yt_out = v_path / f"carousel_ytdlp__{file_prefix}.%(ext)s"
+                    if await asyncio.to_thread(download_with_ytdlp, url, yt_out):
+                        logger.success(f"{log_prefix} 📥 Carousel yt-dlp done.")
+                    else:
+                        logger.error(f"{log_prefix} ❌ Carousel yt-dlp fallback failed.")
+
+                # Always download background audio for carousel
+                music_data = item.get("music", {})
+                audio_url  = music_data.get("playUrl")
+                if isinstance(audio_url, dict):
+                    audio_url = audio_url.get("urlList", [None])[0]
+                if isinstance(audio_url, list):
+                    audio_url = audio_url[0]
+                if audio_url:
+                    await self.download_file_httpx(
+                        audio_url, v_path / f"audio__{file_prefix}.mp3", log_prefix, "Carousel Audio")
             else:
                 video_data = item.get("video", {})
                 play_url   = None
