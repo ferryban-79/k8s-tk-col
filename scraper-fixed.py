@@ -37,11 +37,11 @@ CONFIG = {
     "timeout":                60.0,
     "delay_between_pages":    (1.0, 2.5),
     "delay_between_videos":   (1.0, 3.0),
-    "video_concurrency":      10,
-    "comment_concurrency":    8,
+    "video_concurrency":      10,   # ← same as before
+    "comment_concurrency":    8,    # ← same as before
     "max_comments_limit":     10000,
     "rclone_remote":          "vfx",
-    "upload_concurrency":     4,
+    "upload_concurrency":     1,    # ← FIX: was 4, now 1 (Mega ceiling fix)
 }
 
 _upload_sem: asyncio.Semaphore = None
@@ -106,6 +106,14 @@ def clean_caption(text: str) -> str:
     text = re.sub(r'[^a-zA-Z0-9 \-_\.]', ' ', text)
     text = re.sub(r'[ _]+', '_', text).strip('_. ')
     return text[:40] if text.strip('_. ') else 'no_caption'
+
+def sanitize_folder_name(name: str) -> str:
+    # FIX 1: Replace dots and slashes — Mega rejects dots, slashes break local paths
+    # FIX 2: Replace any other chars Mega dislikes
+    name = name.replace(".", "_")   # dot → underscore  (fixes: Invalid arguments)
+    name = name.replace("/", "_")   # slash → underscore (fixes: [Errno 2] No such file or directory)
+    name = name.replace("\\", "_")  # backslash safety
+    return name
 
 def human_ts(unix_ts):
     if not unix_ts:
@@ -200,6 +208,10 @@ def download_with_ytdlp(url, output_path):
 
 # ---------------------------------------------------------
 # 7. Rclone Upload
+# FIX 3: upload_concurrency=1, transfers=2 → max 2 connections per pod
+#         15 pods × 2 = 30 total → under Mega's 32 ceiling
+# FIX 4: Added timeout flags → fixes "unexpected end of JSON / session cut"
+# FIX 5: Added retries=10, low-level-retries=20 → auto-recover on session drops
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
     global _upload_sem
@@ -210,11 +222,14 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
             logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
             cmd = [
                 "rclone", "copy", str(local_folder_path), remote_path,
-                "--transfers", "8",
-                "--checkers", "16",
-                "--retries", "5",
-                "--low-level-retries", "10",
-                "--log-level", "ERROR",
+                "--transfers",         "2",    # FIX: was 8 → now 2 (Mega ceiling)
+                "--checkers",          "4",    # FIX: was 16 → now 4
+                "--retries",           "10",   # FIX: was 5 → now 10 (session drop recovery)
+                "--low-level-retries", "20",   # FIX: was 10 → now 20
+                "--timeout",           "120s", # FIX: NEW — prevents session timeout cuts
+                "--contimeout",        "60s",  # FIX: NEW — connect timeout
+                "--retries-sleep",     "5s",   # FIX: NEW — wait before retry
+                "--log-level",         "ERROR",
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -326,12 +341,16 @@ class TikTokScraperV5:
         post_ts    = human_ts(item.get("createTime"))
         log_prefix = f"{track_id} [@{author}]"
 
-        # ✅ FIX: dots in folder_name replaced with slash — Mega accepts this
-        folder_name = f"@{author}_{cap_slug}_{v_id}".replace(".", "/")
+        # ✅ FIX 1 & 2: sanitize_folder_name handles dots AND slashes
+        # dot  → underscore : fixes "Invalid arguments" (Mega rejects dots)
+        # slash → underscore : fixes "[Errno 2] No such file or directory"
+        raw_folder  = f"@{author}_{cap_slug}_{v_id}"
+        folder_name = sanitize_folder_name(raw_folder)
+
         f_base      = f"@{author}_{cap_slug}"
         f_ts_id     = f"{post_ts}_{v_id}"
         v_path      = self.base_path / folder_name
-        v_path.mkdir(exist_ok=True)
+        v_path.mkdir(parents=True, exist_ok=True)
 
         # ── 1. JSON FILES ─────────────────────────────────────────────────
         (v_path / f"{f_base}_RAW-meta_{f_ts_id}.json").write_text(
