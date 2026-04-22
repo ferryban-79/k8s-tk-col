@@ -14,16 +14,14 @@ if sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ---------------------------------------------------------
-# 1. Batch Folder Setup  ← BUG FIX: empty string check
+# 1. Batch Folder Setup
 # ---------------------------------------------------------
 _env_batch = os.environ.get("BATCH_FOLDER_NAME", "").strip()
 BATCH_FOLDER_NAME = _env_batch if _env_batch else \
     f"Batch--{datetime.now().strftime('%Y-%m-%d-%A_%I-%M-%S-%p')}"
 
-# Parallel chunk config (for GitHub Actions Matrix / K8s)
-# CHUNK_INDEX=0..N-1, TOTAL_CHUNKS=N  (default = single worker, process all)
-CHUNK_INDEX   = int(os.environ.get("CHUNK_INDEX",   "0"))
-TOTAL_CHUNKS  = int(os.environ.get("TOTAL_CHUNKS",  "1"))
+CHUNK_INDEX  = int(os.environ.get("CHUNK_INDEX",  "0"))
+TOTAL_CHUNKS = int(os.environ.get("TOTAL_CHUNKS", "1"))
 
 try:
     os.makedirs(BATCH_FOLDER_NAME, exist_ok=True)
@@ -43,19 +41,15 @@ CONFIG = {
     "comment_concurrency":    8,
     "max_comments_limit":     10000,
     "rclone_remote":          "vfx",
-    # Limit concurrent rclone uploads to avoid Mega rate-limiting
-    # 20 workers all uploading = Mega API errors. Cap at 4 simultaneous.
     "upload_concurrency":     4,
 }
 
-# Global upload semaphore (set in main after CONFIG ready)
 _upload_sem: asyncio.Semaphore = None
 
 # ---------------------------------------------------------
 # 2. TXT-Based Tracking System
-#    Each chunk writes to its own file to avoid conflicts
 # ---------------------------------------------------------
-_suffix = f"_chunk{CHUNK_INDEX}" if TOTAL_CHUNKS > 1 else ""
+_suffix        = f"_chunk{CHUNK_INDEX}" if TOTAL_CHUNKS > 1 else ""
 TRACKING_FILE  = f"tracking_report{_suffix}.txt"
 COMPLETED_FILE = f"completed{_suffix}.txt"
 FAILED_FILE    = f"failed{_suffix}.txt"
@@ -108,15 +102,10 @@ logger.add(LOG_FILE, level="DEBUG",
 # 4. Helpers
 # ---------------------------------------------------------
 def clean_caption(text: str) -> str:
-    """
-    Whitelist approach — only a-z A-Z 0-9 space hyphen underscore dot survive.
-    Kills: emojis, hashtags, commas, Arabic, CJK, quotes, @, etc.
-    This is the ONLY safe way to name folders/files for Mega via rclone.
-    """
-    text = re.sub(r'#\w*', '', text)                    # remove hashtags
-    text = re.sub(r'[^a-zA-Z0-9 \-_\.]', ' ', text)   # whitelist
-    text = re.sub(r'[ _]+', '_', text).strip('_. ')      # collapse spaces
-    return text[:40] if text.strip('_. ') else 'no_caption' 
+    text = re.sub(r'#\w*', '', text)
+    text = re.sub(r'[^a-zA-Z0-9 \-_\.]', ' ', text)
+    text = re.sub(r'[ _]+', '_', text).strip('_. ')
+    return text[:40] if text.strip('_. ') else 'no_caption'
 
 def human_ts(unix_ts):
     if not unix_ts:
@@ -127,14 +116,9 @@ def human_ts(unix_ts):
         return datetime.now().strftime("%Y-%m-%d")
 
 # ---------------------------------------------------------
-# 5. H.264 Codec Fix  ← NEW: transcode HEVC → H.264
+# 5. H.264 Codec Fix  ✅ FIX 3: pix_fmt yuv420p added
 # ---------------------------------------------------------
 async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
-    """
-    Check video codec with ffprobe.
-    If not H.264/AVC, transcode using ffmpeg (fast preset).
-    This fixes 'codec not supported by browser' errors.
-    """
     if not video_path.exists():
         return False
     try:
@@ -152,7 +136,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         codec = stdout.decode().strip().lower()
 
         if codec in ("h264", "avc1", "avc"):
-            return True  # Already H.264, silent
+            return True  # Already H.264, nothing to do
 
         logger.debug(f"{log_prefix} codec={codec} → re-encoding to H.264 silently...")
         tmp_path = video_path.with_suffix(".h264_tmp.mp4")
@@ -161,6 +145,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
             "ffmpeg", "-i", str(video_path),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-profile:v", "high", "-level", "4.1",
+            "-pix_fmt", "yuv420p",        # ✅ FIX: browser/player compatibility
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-y", str(tmp_path)
@@ -189,7 +174,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         return False
 
 # ---------------------------------------------------------
-# 6. YT-DLP — guaranteed H.264 (format_sort forces it, ffmpeg converts if needed)
+# 6. YT-DLP  ✅ FIX 2: force avc1 (H.264) — no blank videos
 # ---------------------------------------------------------
 def download_with_ytdlp(url, output_path):
     ydl_opts = {
@@ -198,10 +183,12 @@ def download_with_ytdlp(url, output_path):
         'no_warnings':         True,
         'noprogress':          True,
         'socket_timeout':      30,
-        # PRIMARY FIX: format_sort forces H.264/AVC selection before download
-        # This prevents yt-dlp from picking HEVC/AV1 which causes blank video
-        'format':              'bestvideo+bestaudio/best',
-        'format_sort':         ['vcodec:h264', 'ext:mp4', 'ext:m4a'],
+        # ✅ FIX: avc1 force — HEVC/AV1 kabhi select nahi hoga
+        'format': (
+            'bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]'
+            '/bestvideo[vcodec^=avc1]+bestaudio'
+            '/bestvideo+bestaudio/best'
+        ),
         'merge_output_format': 'mp4',
     }
     try:
@@ -213,7 +200,7 @@ def download_with_ytdlp(url, output_path):
         return False
 
 # ---------------------------------------------------------
-# 7. Rclone Upload — async
+# 7. Rclone Upload  ✅ FIX 1: --mega-pacer-min-sleep removed
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
     global _upload_sem
@@ -228,7 +215,7 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
                 "--checkers", "16",
                 "--retries", "5",
                 "--low-level-retries", "10",
-                "--mega-pacer-min-sleep", "100ms",  # throttle Mega API calls
+                # ✅ FIX: --mega-pacer-min-sleep hata diya (purane rclone mein yeh flag nahi)
                 "--log-level", "ERROR",
             ]
             proc = await asyncio.create_subprocess_exec(
@@ -249,7 +236,6 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
             logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
 
 async def upload_report_files():
-    """Upload all tracking/log files to Mega _Reports folder after run."""
     for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]:
         if not os.path.exists(fpath):
             continue
@@ -327,7 +313,7 @@ class TikTokScraperV5:
             return None
 
     async def scrape_video(self, url, index, total, file_lock):
-        track_id   = f"[{index}/{total}]"
+        track_id  = f"[{index}/{total}]"
         logger.info(f"{'-'*50}\n{track_id} 🚀 URL: {url}")
 
         item = await self.get_video_meta(url, track_id)
@@ -336,22 +322,19 @@ class TikTokScraperV5:
             await track_failed(url, "Meta fetch failed / Blocked", file_lock)
             return False
 
-        v_id        = item["id"]
-        author      = item.get("author", {}).get("uniqueId", "unknown")
-        cap_slug    = clean_caption(item.get("desc", "no_caption"))
-        post_ts     = human_ts(item.get("createTime"))
-        log_prefix  = f"{track_id} [@{author}]"
+        v_id       = item["id"]
+        author     = item.get("author", {}).get("uniqueId", "unknown")
+        cap_slug   = clean_caption(item.get("desc", "no_caption"))
+        post_ts    = human_ts(item.get("createTime"))
+        log_prefix = f"{track_id} [@{author}]"
 
-        # ── Naming scheme: @author_caption_FILETYPE_timestamp_postid.ext ──
-        # Folder  : @author_caption_postid  (no filetype)
-        # Files   : @author_caption_FILETYPE_timestamp_postid.ext
         folder_name = f"@{author}_{cap_slug}_{v_id}"
-        f_base      = f"@{author}_{cap_slug}"       # shared prefix for all files
-        f_ts_id     = f"{post_ts}_{v_id}"           # timestamp_postid suffix
+        f_base      = f"@{author}_{cap_slug}"
+        f_ts_id     = f"{post_ts}_{v_id}"
         v_path      = self.base_path / folder_name
         v_path.mkdir(exist_ok=True)
 
-        # ── 1. JSON FILES (9 files total) ─────────────────────────────────
+        # ── 1. JSON FILES ─────────────────────────────────────────────────
         (v_path / f"{f_base}_RAW-meta_{f_ts_id}.json").write_text(
             json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -384,7 +367,7 @@ class TikTokScraperV5:
 
         logger.success(f"{log_prefix} 📝 Saved: RAW-meta, meta, caption, account")
 
-        # ── 2. MEDIA DOWNLOADS ─────────────────────────────────────────────
+        # ── 2. MEDIA DOWNLOADS ────────────────────────────────────────────
         if self.cfg.get("download_media", True):
 
             # Avatar
@@ -392,16 +375,18 @@ class TikTokScraperV5:
                           or item.get("author", {}).get("avatarMedium"))
             if avatar_url:
                 await self.download_file_httpx(
-                    avatar_url, v_path / f"{f_base}_avatar_{f_ts_id}.jpg", log_prefix, "Avatar")
+                    avatar_url,
+                    v_path / f"{f_base}_avatar_{f_ts_id}.jpg",
+                    log_prefix, "Avatar")
 
-            # Photo carousel OR video — DUAL APPROACH
             image_post = item.get("imagePost")
             if image_post and image_post.get("images"):
+                # ── CAROUSEL (Dual Approach) ──────────────────────────────
                 images = image_post.get("images", [])
                 logger.info(f"{log_prefix} 📸 Carousel mode ({len(images)} images).")
                 failed_indices = []
 
-                # Pass 1: Direct httpx download for each image
+                # Pass 1: Direct httpx download
                 for i, img in enumerate(images):
                     img_url = (
                         img.get("imageURL",    {}).get("urlList", [None])[0]
@@ -409,22 +394,25 @@ class TikTokScraperV5:
                     )
                     img_path = v_path / f"{f_base}_carousel-{i+1:03d}_{f_ts_id}.jpg"
                     if img_url:
-                        ok = await self.download_file_httpx(img_url, img_path, log_prefix, f"Carousel {i+1}")
+                        ok = await self.download_file_httpx(
+                            img_url, img_path, log_prefix, f"Carousel {i+1}")
                         if not ok:
                             failed_indices.append(i)
                     else:
                         failed_indices.append(i)
 
-                # Pass 2: yt-dlp fallback if any images failed
+                # Pass 2: yt-dlp fallback for any failed images
                 if failed_indices:
-                    logger.info(f"{log_prefix} 🔄 Carousel yt-dlp fallback for {len(failed_indices)} failed images...")
+                    logger.info(
+                        f"{log_prefix} 🔄 Carousel yt-dlp fallback "
+                        f"for {len(failed_indices)} failed images...")
                     yt_out = v_path / f"{f_base}_carousel-ytdlp_{f_ts_id}.%(ext)s"
                     if await asyncio.to_thread(download_with_ytdlp, url, yt_out):
                         logger.success(f"{log_prefix} 📥 Carousel yt-dlp done.")
                     else:
                         logger.error(f"{log_prefix} ❌ Carousel yt-dlp fallback failed.")
 
-                # Always download background audio for carousel
+                # Background audio for carousel
                 music_data = item.get("music", {})
                 audio_url  = music_data.get("playUrl")
                 if isinstance(audio_url, dict):
@@ -433,8 +421,12 @@ class TikTokScraperV5:
                     audio_url = audio_url[0]
                 if audio_url:
                     await self.download_file_httpx(
-                        audio_url, v_path / f"{f_base}_audio_{f_ts_id}.mp3", log_prefix, "Carousel Audio")
+                        audio_url,
+                        v_path / f"{f_base}_audio_{f_ts_id}.mp3",
+                        log_prefix, "Carousel Audio")
+
             else:
+                # ── VIDEO ─────────────────────────────────────────────────
                 video_data = item.get("video", {})
                 play_url   = None
 
@@ -460,15 +452,16 @@ class TikTokScraperV5:
                 if play_url:
                     try:
                         resp = await self.client.get(
-                            play_url, headers=self.headers, timeout=90, follow_redirects=True)
+                            play_url, headers=self.headers,
+                            timeout=90, follow_redirects=True)
                         if resp.status_code == 200:
                             video_path.write_bytes(resp.content)
                             logger.success(f"{log_prefix} 📥 Video Saved (Direct).")
                             success = True
-                            # ← FIX: Check + transcode to H.264 if needed
                             await ensure_h264(video_path, log_prefix)
                         else:
-                            logger.warning(f"{log_prefix} ⚠️ Direct {resp.status_code} → yt-dlp...")
+                            logger.warning(
+                                f"{log_prefix} ⚠️ Direct {resp.status_code} → yt-dlp...")
                     except Exception as e:
                         logger.warning(f"{log_prefix} ⚠️ Direct error → yt-dlp: {e}")
 
@@ -476,7 +469,6 @@ class TikTokScraperV5:
                     logger.info(f"{log_prefix} 🔄 yt-dlp fallback (strict H.264)...")
                     if await asyncio.to_thread(download_with_ytdlp, url, video_path):
                         logger.success(f"{log_prefix} 📥 Video Saved (yt-dlp).")
-                        # yt-dlp format string tries H.264 but verify anyway
                         await ensure_h264(video_path, log_prefix)
                     else:
                         logger.error(f"{log_prefix} ❌ Video download failed.")
@@ -490,12 +482,14 @@ class TikTokScraperV5:
                     audio_url = audio_url[0]
                 if audio_url:
                     await self.download_file_httpx(
-                        audio_url, v_path / f"{f_base}_audio_{f_ts_id}.mp3", log_prefix, "Audio")
+                        audio_url,
+                        v_path / f"{f_base}_audio_{f_ts_id}.mp3",
+                        log_prefix, "Audio")
 
-        # ── 3. COMMENTS ────────────────────────────────────────────────────
+        # ── 3. COMMENTS ───────────────────────────────────────────────────
         await self.fetch_comments(v_id, v_path, f_base, f_ts_id, log_prefix)
 
-        # ── 4. UPLOAD + TRACK ──────────────────────────────────────────────
+        # ── 4. UPLOAD + TRACK ─────────────────────────────────────────────
         await upload_to_mega(v_path, folder_name, log_prefix)
         await track_success(url, file_lock)
         return True
@@ -557,7 +551,8 @@ class TikTokScraperV5:
                 try:
                     resp = await self.client.get(
                         "https://www.tiktok.com/api/comment/list/",
-                        params={"aweme_id": video_id, "cursor": cursor, "count": 50, "aid": "1988"},
+                        params={"aweme_id": video_id, "cursor": cursor,
+                                "count": 50, "aid": "1988"},
                         headers=self.headers)
                     data = resp.json()
                 except:
@@ -581,7 +576,9 @@ class TikTokScraperV5:
                 })
                 if c.get("reply_comment_total", 0) > 0:
                     reply_tasks.append(
-                        self.fetch_replies(video_id, c.get("cid"), raw_comments, clean_comments, log_prefix))
+                        self.fetch_replies(
+                            video_id, c.get("cid"),
+                            raw_comments, clean_comments, log_prefix))
 
             if reply_tasks:
                 await asyncio.gather(*reply_tasks)
@@ -589,8 +586,10 @@ class TikTokScraperV5:
             has_more = data.get("has_more", 0)
             cursor   = data.get("cursor", cursor + len(curr_batch))
 
-            raw_path.write_text(json.dumps(raw_comments,    indent=2, ensure_ascii=False), encoding="utf-8")
-            clean_path.write_text(json.dumps(clean_comments, indent=2, ensure_ascii=False), encoding="utf-8")
+            raw_path.write_text(
+                json.dumps(raw_comments,    indent=2, ensure_ascii=False), encoding="utf-8")
+            clean_path.write_text(
+                json.dumps(clean_comments, indent=2, ensure_ascii=False), encoding="utf-8")
 
             if len(raw_comments) % 100 < 50:
                 logger.info(f"{log_prefix} 💬 Saved {len(raw_comments)} comments so far...")
@@ -626,16 +625,17 @@ async def main():
 
     all_urls = [l.strip() for l in open("links.txt", encoding="utf-8") if l.strip()]
 
-    # ─ Chunk assignment: this worker handles every TOTAL_CHUNKS-th URL ─────
     if TOTAL_CHUNKS > 1:
         my_urls = [u for i, u in enumerate(all_urls) if i % TOTAL_CHUNKS == CHUNK_INDEX]
-        logger.info(f"📦 Chunk {CHUNK_INDEX+1}/{TOTAL_CHUNKS}: assigned {len(my_urls)}/{len(all_urls)} URLs")
+        logger.info(
+            f"📦 Chunk {CHUNK_INDEX+1}/{TOTAL_CHUNKS}: "
+            f"assigned {len(my_urls)}/{len(all_urls)} URLs")
     else:
         my_urls = all_urls
 
-    done_urls = load_set_from_file(COMPLETED_FILE)
-
+    done_urls   = load_set_from_file(COMPLETED_FILE)
     failed_urls = load_set_from_file(FAILED_FILE)
+
     if failed_urls:
         open(FAILED_FILE, "w").close()
         logger.info(f"🔄 Retrying {len(failed_urls)} previously failed URLs.")
@@ -665,8 +665,8 @@ async def main():
 
     global _upload_sem
     _upload_sem = asyncio.Semaphore(CONFIG["upload_concurrency"])
-    sem_video = asyncio.Semaphore(CONFIG["video_concurrency"])
-    scraper   = TikTokScraperV5(CONFIG)
+    sem_video   = asyncio.Semaphore(CONFIG["video_concurrency"])
+    scraper     = TikTokScraperV5(CONFIG)
 
     try:
         tasks = [
