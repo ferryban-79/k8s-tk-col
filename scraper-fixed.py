@@ -42,8 +42,14 @@ CONFIG = {
     "video_concurrency":      10,
     "comment_concurrency":    8,
     "max_comments_limit":     10000,
-    "rclone_remote":          "vfx"
+    "rclone_remote":          "vfx",
+    # Limit concurrent rclone uploads to avoid Mega rate-limiting
+    # 20 workers all uploading = Mega API errors. Cap at 4 simultaneous.
+    "upload_concurrency":     4,
 }
+
+# Global upload semaphore (set in main after CONFIG ready)
+_upload_sem: asyncio.Semaphore = None
 
 # ---------------------------------------------------------
 # 2. TXT-Based Tracking System
@@ -101,29 +107,24 @@ logger.add(LOG_FILE, level="DEBUG",
 # ---------------------------------------------------------
 # 4. Helpers
 # ---------------------------------------------------------
-def clean_filename(text):
+def clean_caption(text: str) -> str:
     """
-    Produce a filename/folder-name safe string for BOTH local disk and Mega (rclone).
-    Mega rejects: emojis, non-ASCII unicode (🥲 シ …), hashtags, and many special chars.
-    Root cause of rclone 'Invalid arguments' error.
+    Whitelist approach — only a-z A-Z 0-9 space hyphen underscore dot survive.
+    Kills: emojis, hashtags, commas, Arabic, CJK, quotes, @, etc.
+    This is the ONLY safe way to name folders/files for Mega via rclone.
     """
-    # 1. Remove hashtags entirely (stored in caption__.json anyway)
-    text = re.sub(r'#\w+', '', text)
-    # 2. Strip non-ASCII chars (emojis, CJK, Arabic, special unicode like … 🥲 シ)
-    text = text.encode('ascii', 'ignore').decode('ascii')
-    # 3. Remove filesystem-unsafe chars
-    text = re.sub(r'[\/*?:"<>|\\]', '', text)
-    # 4. Collapse whitespace → single underscore, strip edges
-    text = re.sub(r'[\s_]+', '_', text).strip('_- ')
-    return text[:50] if text.strip() else "no_caption"
+    text = re.sub(r'#\w*', '', text)                    # remove hashtags
+    text = re.sub(r'[^a-zA-Z0-9 \-_\.]', ' ', text)   # whitelist
+    text = re.sub(r'[ _]+', '_', text).strip('_. ')      # collapse spaces
+    return text[:40] if text.strip('_. ') else 'no_caption' 
 
 def human_ts(unix_ts):
     if not unix_ts:
-        return datetime.now().strftime("%Y-%m-%d_%H-%M")
+        return datetime.now().strftime("%Y-%m-%d")
     try:
-        return datetime.fromtimestamp(int(unix_ts)).strftime("%Y-%m-%d_%H-%M")
+        return datetime.fromtimestamp(int(unix_ts)).strftime("%Y-%m-%d")
     except:
-        return datetime.now().strftime("%Y-%m-%d_%H-%M")
+        return datetime.now().strftime("%Y-%m-%d")
 
 # ---------------------------------------------------------
 # 5. H.264 Codec Fix  ← NEW: transcode HEVC → H.264
@@ -151,10 +152,9 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         codec = stdout.decode().strip().lower()
 
         if codec in ("h264", "avc1", "avc"):
-            logger.info(f"{log_prefix} ✅ Codec OK (H.264) — no transcode needed.")
-            return True
+            return True  # Already H.264, silent
 
-        logger.warning(f"{log_prefix} ⚠️ Codec '{codec}' not browser-compatible → transcoding to H.264...")
+        logger.debug(f"{log_prefix} codec={codec} → re-encoding to H.264 silently...")
         tmp_path = video_path.with_suffix(".h264_tmp.mp4")
 
         transcode_cmd = [
@@ -174,7 +174,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
 
         if proc.returncode == 0 and tmp_path.exists():
             tmp_path.replace(video_path)
-            logger.success(f"{log_prefix} 🎬 Transcoded to H.264.")
+            logger.debug(f"{log_prefix} re-encoded → H.264 done.")
             return True
         else:
             logger.error(f"{log_prefix} ❌ Transcode failed: {stderr.decode()[:300]}")
@@ -216,29 +216,37 @@ def download_with_ytdlp(url, output_path):
 # 7. Rclone Upload — async
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
-    try:
-        remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/{folder_name}"
-        logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
-        cmd = [
-            "rclone", "copy", str(local_folder_path), remote_path,
-            "--transfers", "32", "--checkers", "64", "--log-level", "ERROR"
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
-            try:
-                import shutil
-                shutil.rmtree(local_folder_path)
-                logger.info(f"{log_prefix} 🗑️ Local data deleted.")
-            except:
-                pass
-        else:
-            logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
-    except Exception as e:
-        logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
+    global _upload_sem
+    sem = _upload_sem or asyncio.Semaphore(CONFIG["upload_concurrency"])
+    async with sem:
+        try:
+            remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/{folder_name}"
+            logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
+            cmd = [
+                "rclone", "copy", str(local_folder_path), remote_path,
+                "--transfers", "8",
+                "--checkers", "16",
+                "--retries", "5",
+                "--low-level-retries", "10",
+                "--mega-pacer-min-sleep", "100ms",  # throttle Mega API calls
+                "--log-level", "ERROR",
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
+                try:
+                    import shutil
+                    shutil.rmtree(local_folder_path)
+                    logger.info(f"{log_prefix} 🗑️ Local data deleted.")
+                except:
+                    pass
+            else:
+                logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
+        except Exception as e:
+            logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
 
 async def upload_report_files():
     """Upload all tracking/log files to Mega _Reports folder after run."""
@@ -330,20 +338,24 @@ class TikTokScraperV5:
 
         v_id        = item["id"]
         author      = item.get("author", {}).get("uniqueId", "unknown")
-        desc_slug   = clean_filename(item.get("desc", "no_caption"))
+        cap_slug    = clean_caption(item.get("desc", "no_caption"))
         post_ts     = human_ts(item.get("createTime"))
         log_prefix  = f"{track_id} [@{author}]"
 
-        file_prefix   = f"@{author}_{desc_slug}_{v_id}"
-        folder_prefix = file_prefix
-        v_path        = self.base_path / folder_prefix
+        # ── Naming scheme: @author_caption_FILETYPE_timestamp_postid.ext ──
+        # Folder  : @author_caption_postid  (no filetype)
+        # Files   : @author_caption_FILETYPE_timestamp_postid.ext
+        folder_name = f"@{author}_{cap_slug}_{v_id}"
+        f_base      = f"@{author}_{cap_slug}"       # shared prefix for all files
+        f_ts_id     = f"{post_ts}_{v_id}"           # timestamp_postid suffix
+        v_path      = self.base_path / folder_name
         v_path.mkdir(exist_ok=True)
 
-        # ── 1. JSON FILES ──────────────────────────────────────────────────
-        (v_path / f"RAW_meta__{file_prefix}.json").write_text(
+        # ── 1. JSON FILES (9 files total) ─────────────────────────────────
+        (v_path / f"{f_base}_RAW-meta_{f_ts_id}.json").write_text(
             json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"meta__{file_prefix}.json").write_text(
+        (v_path / f"{f_base}_meta_{f_ts_id}.json").write_text(
             json.dumps({
                 "post_info": {
                     "id":         v_id,
@@ -356,7 +368,7 @@ class TikTokScraperV5:
                 "music":  item.get("music", {})
             }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"caption__{file_prefix}.json").write_text(
+        (v_path / f"{f_base}_caption_{f_ts_id}.json").write_text(
             json.dumps({
                 "username": author,
                 "post_url": url,
@@ -364,13 +376,13 @@ class TikTokScraperV5:
                 "hashtags": re.findall(r"#\w+", item.get("desc", ""))
             }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"account__{file_prefix}.json").write_text(
+        (v_path / f"{f_base}_account_{f_ts_id}.json").write_text(
             json.dumps({
                 "author_details": item.get("author", {}),
                 "author_stats":   item.get("authorStats", {})
             }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        logger.success(f"{log_prefix} 📝 Saved: RAW_meta, meta, caption, account")
+        logger.success(f"{log_prefix} 📝 Saved: RAW-meta, meta, caption, account")
 
         # ── 2. MEDIA DOWNLOADS ─────────────────────────────────────────────
         if self.cfg.get("download_media", True):
@@ -380,7 +392,7 @@ class TikTokScraperV5:
                           or item.get("author", {}).get("avatarMedium"))
             if avatar_url:
                 await self.download_file_httpx(
-                    avatar_url, v_path / f"avatar__{file_prefix}.jpg", log_prefix, "Avatar")
+                    avatar_url, v_path / f"{f_base}_avatar_{f_ts_id}.jpg", log_prefix, "Avatar")
 
             # Photo carousel OR video — DUAL APPROACH
             image_post = item.get("imagePost")
@@ -395,7 +407,7 @@ class TikTokScraperV5:
                         img.get("imageURL",    {}).get("urlList", [None])[0]
                         or img.get("displayImage", {}).get("urlList", [None])[0]
                     )
-                    img_path = v_path / f"carousel_{i+1:03d}__{file_prefix}.jpg"
+                    img_path = v_path / f"{f_base}_carousel-{i+1:03d}_{f_ts_id}.jpg"
                     if img_url:
                         ok = await self.download_file_httpx(img_url, img_path, log_prefix, f"Carousel {i+1}")
                         if not ok:
@@ -406,7 +418,7 @@ class TikTokScraperV5:
                 # Pass 2: yt-dlp fallback if any images failed
                 if failed_indices:
                     logger.info(f"{log_prefix} 🔄 Carousel yt-dlp fallback for {len(failed_indices)} failed images...")
-                    yt_out = v_path / f"carousel_ytdlp__{file_prefix}.%(ext)s"
+                    yt_out = v_path / f"{f_base}_carousel-ytdlp_{f_ts_id}.%(ext)s"
                     if await asyncio.to_thread(download_with_ytdlp, url, yt_out):
                         logger.success(f"{log_prefix} 📥 Carousel yt-dlp done.")
                     else:
@@ -421,7 +433,7 @@ class TikTokScraperV5:
                     audio_url = audio_url[0]
                 if audio_url:
                     await self.download_file_httpx(
-                        audio_url, v_path / f"audio__{file_prefix}.mp3", log_prefix, "Carousel Audio")
+                        audio_url, v_path / f"{f_base}_audio_{f_ts_id}.mp3", log_prefix, "Carousel Audio")
             else:
                 video_data = item.get("video", {})
                 play_url   = None
@@ -442,7 +454,7 @@ class TikTokScraperV5:
                         elif isinstance(val, list) and val:
                             play_url = val[0]; break
 
-                video_path = v_path / f"video__{file_prefix}.mp4"
+                video_path = v_path / f"{f_base}_video_{f_ts_id}.mp4"
                 success    = False
 
                 if play_url:
@@ -478,13 +490,13 @@ class TikTokScraperV5:
                     audio_url = audio_url[0]
                 if audio_url:
                     await self.download_file_httpx(
-                        audio_url, v_path / f"audio__{file_prefix}.mp3", log_prefix, "Audio")
+                        audio_url, v_path / f"{f_base}_audio_{f_ts_id}.mp3", log_prefix, "Audio")
 
         # ── 3. COMMENTS ────────────────────────────────────────────────────
-        await self.fetch_comments(v_id, v_path, file_prefix, log_prefix)
+        await self.fetch_comments(v_id, v_path, f_base, f_ts_id, log_prefix)
 
         # ── 4. UPLOAD + TRACK ──────────────────────────────────────────────
-        await upload_to_mega(v_path, folder_prefix, log_prefix)
+        await upload_to_mega(v_path, folder_name, log_prefix)
         await track_success(url, file_lock)
         return True
 
@@ -519,9 +531,9 @@ class TikTokScraperV5:
                 except:
                     break
 
-    async def fetch_comments(self, video_id, path, file_prefix, log_prefix):
-        raw_path   = path / f"RAW_comments__{file_prefix}.json"
-        clean_path = path / f"comments__{file_prefix}.json"
+    async def fetch_comments(self, video_id, path, f_base, f_ts_id, log_prefix):
+        raw_path   = path / f"{f_base}_RAW-comments_{f_ts_id}.json"
+        clean_path = path / f"{f_base}_comments_{f_ts_id}.json"
 
         raw_comments, clean_comments, cursor = [], [], 0
 
@@ -651,6 +663,8 @@ async def main():
     for u in skipped:
         await track_skipped(u, "Already completed", file_lock)
 
+    global _upload_sem
+    _upload_sem = asyncio.Semaphore(CONFIG["upload_concurrency"])
     sem_video = asyncio.Semaphore(CONFIG["video_concurrency"])
     scraper   = TikTokScraperV5(CONFIG)
 
