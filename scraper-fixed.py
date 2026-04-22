@@ -116,7 +116,7 @@ def human_ts(unix_ts):
         return datetime.now().strftime("%Y-%m-%d")
 
 # ---------------------------------------------------------
-# 5. H.264 Codec Fix  ✅ FIX 3: pix_fmt yuv420p added
+# 5. H.264 Codec Fix
 # ---------------------------------------------------------
 async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
     if not video_path.exists():
@@ -136,7 +136,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         codec = stdout.decode().strip().lower()
 
         if codec in ("h264", "avc1", "avc"):
-            return True  # Already H.264, nothing to do
+            return True
 
         logger.debug(f"{log_prefix} codec={codec} → re-encoding to H.264 silently...")
         tmp_path = video_path.with_suffix(".h264_tmp.mp4")
@@ -145,7 +145,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
             "ffmpeg", "-i", str(video_path),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-profile:v", "high", "-level", "4.1",
-            "-pix_fmt", "yuv420p",        # ✅ FIX: browser/player compatibility
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-y", str(tmp_path)
@@ -174,7 +174,7 @@ async def ensure_h264(video_path: Path, log_prefix: str) -> bool:
         return False
 
 # ---------------------------------------------------------
-# 6. YT-DLP  ✅ FIX 2: force avc1 (H.264) — no blank videos
+# 6. YT-DLP
 # ---------------------------------------------------------
 def download_with_ytdlp(url, output_path):
     ydl_opts = {
@@ -183,7 +183,6 @@ def download_with_ytdlp(url, output_path):
         'no_warnings':         True,
         'noprogress':          True,
         'socket_timeout':      30,
-        # ✅ FIX: avc1 force — HEVC/AV1 kabhi select nahi hoga
         'format': (
             'bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]'
             '/bestvideo[vcodec^=avc1]+bestaudio'
@@ -200,7 +199,7 @@ def download_with_ytdlp(url, output_path):
         return False
 
 # ---------------------------------------------------------
-# 7. Rclone Upload  ✅ FIX 1: --mega-pacer-min-sleep removed
+# 7. Rclone Upload
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
     global _upload_sem
@@ -215,7 +214,6 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
                 "--checkers", "16",
                 "--retries", "5",
                 "--low-level-retries", "10",
-                # ✅ FIX: --mega-pacer-min-sleep hata diya (purane rclone mein yeh flag nahi)
                 "--log-level", "ERROR",
             ]
             proc = await asyncio.create_subprocess_exec(
@@ -328,7 +326,8 @@ class TikTokScraperV5:
         post_ts    = human_ts(item.get("createTime"))
         log_prefix = f"{track_id} [@{author}]"
 
-        folder_name = f"@{author}_{cap_slug}_{v_id}"
+        # ✅ FIX: dots in folder_name replaced with slash — Mega accepts this
+        folder_name = f"@{author}_{cap_slug}_{v_id}".replace(".", "/")
         f_base      = f"@{author}_{cap_slug}"
         f_ts_id     = f"{post_ts}_{v_id}"
         v_path      = self.base_path / folder_name
@@ -381,12 +380,11 @@ class TikTokScraperV5:
 
             image_post = item.get("imagePost")
             if image_post and image_post.get("images"):
-                # ── CAROUSEL (Dual Approach) ──────────────────────────────
+                # ── CAROUSEL ─────────────────────────────────────────────
                 images = image_post.get("images", [])
                 logger.info(f"{log_prefix} 📸 Carousel mode ({len(images)} images).")
                 failed_indices = []
 
-                # Pass 1: Direct httpx download
                 for i, img in enumerate(images):
                     img_url = (
                         img.get("imageURL",    {}).get("urlList", [None])[0]
@@ -401,7 +399,6 @@ class TikTokScraperV5:
                     else:
                         failed_indices.append(i)
 
-                # Pass 2: yt-dlp fallback for any failed images
                 if failed_indices:
                     logger.info(
                         f"{log_prefix} 🔄 Carousel yt-dlp fallback "
@@ -412,7 +409,6 @@ class TikTokScraperV5:
                     else:
                         logger.error(f"{log_prefix} ❌ Carousel yt-dlp fallback failed.")
 
-                # Background audio for carousel
                 music_data = item.get("music", {})
                 audio_url  = music_data.get("playUrl")
                 if isinstance(audio_url, dict):
@@ -473,7 +469,6 @@ class TikTokScraperV5:
                     else:
                         logger.error(f"{log_prefix} ❌ Video download failed.")
 
-                # Audio
                 music_data = item.get("music", {})
                 audio_url  = music_data.get("playUrl")
                 if isinstance(audio_url, dict):
