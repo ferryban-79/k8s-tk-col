@@ -127,40 +127,34 @@ def human_ts(unix_ts):
         return datetime.now().strftime("%Y-%m-%d")
 
 # ---------------------------------------------------------
-# NEW: Background cleanup helper (fire-and-forget after upload)
-# ---------------------------------------------------------
-def background_cleanup(path):
-    import shutil
-    if os.path.exists(path):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
-
-# ---------------------------------------------------------
 # NEW: ZIP artifact builder for GitHub Actions
-#      Zips only the files that were NOT uploaded to Mega
-#      (i.e. links in failed.txt) — this is the artifact
-#      that GitHub Actions uploads via actions/upload-artifact
+#      Zips ALL scraped data (entire batch folder) + report files.
+#      NO deletion anywhere — data stays on disk AND in ZIP.
+#      GitHub Actions picks this up via actions/upload-artifact.
+#
+#      Add to your workflow YAML:
+#        - uses: actions/upload-artifact@v4
+#          with:
+#            name: scraper-chunk-${{ matrix.chunk }}
+#            path: "*_artifact.zip"
 # ---------------------------------------------------------
 def build_github_artifact():
     """
-    Build a ZIP of:
-      - All report/tracking files (always included)
-      - Any local video folders still present (failed uploads)
-    The ZIP is written next to the batch folder so GitHub Actions
-    can pick it up with: path: "*.zip"
+    Build a ZIP of everything this pod scraped:
+      - All report/tracking/log files
+      - Entire BATCH_FOLDER_NAME directory (all video folders, all files)
+    Data is NOT deleted — ZIP is an additional copy for GitHub artifact store.
     """
     zip_name = f"{BATCH_FOLDER_NAME}{_suffix}_artifact.zip"
     logger.info(f"📦 Building GitHub artifact ZIP: {zip_name}")
     try:
         with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            # Always include report files
+            # Include all report files
             for rfile in [TRACKING_FILE, COMPLETED_FILE, FAILED_FILE, LOG_FILE]:
                 if os.path.exists(rfile):
                     zf.write(rfile, rfile)
 
-            # Include any local video folders still on disk (failed uploads, partial data)
+            # Include ENTIRE batch folder — all scraped data, no exclusions
             base_path = Path(BATCH_FOLDER_NAME)
             if base_path.exists():
                 for item in base_path.rglob("*"):
@@ -298,10 +292,7 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
             _, stderr = await proc.communicate()
             if proc.returncode == 0:
                 logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
-                # Fire-and-forget background cleanup so pipeline never freezes
-                asyncio.create_task(asyncio.to_thread(background_cleanup, local_folder_path))
-                logger.info(f"{log_prefix} 🧹 Cleanup queued (pipeline continues).")
-                return True   # ← FIX: signal success to caller
+                return True   # ← FIX: signal success to caller — local data kept, no deletion
             else:
                 logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
                 return False  # ← FIX: signal failure — link stays in failed.txt
