@@ -70,12 +70,12 @@ jobs:
   scrape:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 6 hours max
+    timeout-minutes: 350  # Takreeban 6 ghante
 
     strategy:
       matrix:
         chunk: ${{ fromJSON(needs.prepare.outputs.chunk_matrix) }}
-      fail-fast: false  # ← If one worker fails, others keep running
+      fail-fast: false  # Agar ek worker fail ho to baaki chaltay rahein
 
     env:
       BATCH_FOLDER_NAME: ${{ needs.prepare.outputs.batch_name }}
@@ -112,14 +112,11 @@ jobs:
       - name: 🚀 Run Scraper (Worker ${{ matrix.chunk }})
         run: python scraper-fixed.py
 
-      - name: 💾 Save artifacts
+      # Is step mein ab saara data (ZIP file) GitHub par upload ho jayega
+      - name: 📦 Save All Scraped Data (Artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-chunk-${{ matrix.chunk }}
-          path: |
-            completed_chunk${{ matrix.chunk }}.txt
-            failed_chunk${{ matrix.chunk }}.txt
-            tracking_report_chunk${{ matrix.chunk }}.txt
-            scraper_log_chunk${{ matrix.chunk }}.txt
+          name: scraper-chunk-${{ matrix.chunk }}
+          path: "*_artifact.zip"
           retention-days: 7
