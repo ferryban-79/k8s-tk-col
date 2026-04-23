@@ -4,6 +4,7 @@ import json
 import asyncio
 import random
 import re
+import zipfile
 from pathlib import Path
 from datetime import datetime
 import httpx
@@ -37,11 +38,13 @@ CONFIG = {
     "timeout":                60.0,
     "delay_between_pages":    (1.0, 2.5),
     "delay_between_videos":   (1.0, 3.0),
-    "video_concurrency":      10,   # ← same as before
-    "comment_concurrency":    8,    # ← same as before
+    "video_concurrency":      10,
+    "comment_concurrency":    8,
     "max_comments_limit":     10000,
     "rclone_remote":          "vfx",
-    "upload_concurrency":     1,    # ← FIX: was 4, now 1 (Mega ceiling fix)
+    "upload_concurrency":     1,    # ← FIX: 1 per pod × 15 pods × 2 transfers = 30 ≤ 32 Mega ceiling
+    # NEW: Hard limit — scraper will never process more than this many links
+    "hard_link_limit":        1700,
 }
 
 _upload_sem: asyncio.Semaphore = None
@@ -122,6 +125,54 @@ def human_ts(unix_ts):
         return datetime.fromtimestamp(int(unix_ts)).strftime("%Y-%m-%d")
     except:
         return datetime.now().strftime("%Y-%m-%d")
+
+# ---------------------------------------------------------
+# NEW: Background cleanup helper (fire-and-forget after upload)
+# ---------------------------------------------------------
+def background_cleanup(path):
+    import shutil
+    if os.path.exists(path):
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+# ---------------------------------------------------------
+# NEW: ZIP artifact builder for GitHub Actions
+#      Zips only the files that were NOT uploaded to Mega
+#      (i.e. links in failed.txt) — this is the artifact
+#      that GitHub Actions uploads via actions/upload-artifact
+# ---------------------------------------------------------
+def build_github_artifact():
+    """
+    Build a ZIP of:
+      - All report/tracking files (always included)
+      - Any local video folders still present (failed uploads)
+    The ZIP is written next to the batch folder so GitHub Actions
+    can pick it up with: path: "*.zip"
+    """
+    zip_name = f"{BATCH_FOLDER_NAME}{_suffix}_artifact.zip"
+    logger.info(f"📦 Building GitHub artifact ZIP: {zip_name}")
+    try:
+        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            # Always include report files
+            for rfile in [TRACKING_FILE, COMPLETED_FILE, FAILED_FILE, LOG_FILE]:
+                if os.path.exists(rfile):
+                    zf.write(rfile, rfile)
+
+            # Include any local video folders still on disk (failed uploads, partial data)
+            base_path = Path(BATCH_FOLDER_NAME)
+            if base_path.exists():
+                for item in base_path.rglob("*"):
+                    if item.is_file():
+                        zf.write(str(item), str(item))
+
+        size_mb = os.path.getsize(zip_name) / 1_048_576
+        logger.success(f"📦 Artifact ZIP ready: {zip_name} ({size_mb:.1f} MB)")
+        return zip_name
+    except Exception as e:
+        logger.error(f"❌ ZIP build failed: {e}")
+        return None
 
 # ---------------------------------------------------------
 # 5. H.264 Codec Fix
@@ -208,10 +259,18 @@ def download_with_ytdlp(url, output_path):
 
 # ---------------------------------------------------------
 # 7. Rclone Upload
-# FIX 3: upload_concurrency=1, transfers=2 → max 2 connections per pod
-#         15 pods × 2 = 30 total → under Mega's 32 ceiling
-# FIX 4: Added timeout flags → fixes "unexpected end of JSON / session cut"
-# FIX 5: Added retries=10, low-level-retries=20 → auto-recover on session drops
+#
+# SEAMLESS FIX — "Request over quota" root cause:
+#   Multiple pods each running rclone with --transfers=8 floods
+#   Mega's API session ceiling (32 connections max).
+#   15 pods × 1 upload_sem × 2 transfers = 30 ≤ 32  ✓
+#
+# --tpslimit 1  → max 1 API call/sec per rclone process
+# --tpslimit-burst 1 → no burst above that
+# This makes upload SLOW but STEADY and never quota-errors.
+#
+# FIX: Returns True/False so scrape_video can decide pass/fail.
+#      A link is only marked SUCCESS when Mega confirms receipt.
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
     global _upload_sem
@@ -222,13 +281,15 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
             logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
             cmd = [
                 "rclone", "copy", str(local_folder_path), remote_path,
-                "--transfers",         "2",    # FIX: was 8 → now 2 (Mega ceiling)
-                "--checkers",          "4",    # FIX: was 16 → now 4
-                "--retries",           "10",   # FIX: was 5 → now 10 (session drop recovery)
-                "--low-level-retries", "20",   # FIX: was 10 → now 20
-                "--timeout",           "120s", # FIX: NEW — prevents session timeout cuts
-                "--contimeout",        "60s",  # FIX: NEW — connect timeout
-                "--retries-sleep",     "5s",   # FIX: NEW — wait before retry
+                "--transfers",         "2",     # FIX: 15 pods × 2 = 30 ≤ 32 Mega ceiling
+                "--checkers",          "1",     # FIX: minimal checker load
+                "--tpslimit",          "1",     # FIX: NEW — 1 API call/sec max (seamless, no quota burst)
+                "--tpslimit-burst",    "1",     # FIX: NEW — no burst allowed
+                "--retries",           "15",    # FIX: more retries for session drops
+                "--low-level-retries", "20",
+                "--timeout",           "120s",
+                "--contimeout",        "60s",
+                "--retries-sleep",     "5s",
                 "--log-level",         "ERROR",
             ]
             proc = await asyncio.create_subprocess_exec(
@@ -237,16 +298,16 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
             _, stderr = await proc.communicate()
             if proc.returncode == 0:
                 logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
-                try:
-                    import shutil
-                    shutil.rmtree(local_folder_path)
-                    logger.info(f"{log_prefix} 🗑️ Local data deleted.")
-                except:
-                    pass
+                # Fire-and-forget background cleanup so pipeline never freezes
+                asyncio.create_task(asyncio.to_thread(background_cleanup, local_folder_path))
+                logger.info(f"{log_prefix} 🧹 Cleanup queued (pipeline continues).")
+                return True   # ← FIX: signal success to caller
             else:
                 logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
+                return False  # ← FIX: signal failure — link stays in failed.txt
         except Exception as e:
             logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
+            return False
 
 async def upload_report_files():
     for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]:
@@ -254,7 +315,11 @@ async def upload_report_files():
             continue
         try:
             remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/_Reports"
-            cmd = ["rclone", "copy", fpath, remote_path, "--log-level", "ERROR"]
+            cmd = [
+                "rclone", "copy", fpath, remote_path,
+                "--tpslimit", "1", "--tpslimit-burst", "1",
+                "--log-level", "ERROR",
+            ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
@@ -329,10 +394,11 @@ class TikTokScraperV5:
         track_id  = f"[{index}/{total}]"
         logger.info(f"{'-'*50}\n{track_id} 🚀 URL: {url}")
 
+        # ── CHECKPOINT 1: Meta fetch ──────────────────────────────────────────
         item = await self.get_video_meta(url, track_id)
         if not item:
             logger.error(f"{track_id} ❌ Meta not found or Blocked.")
-            await track_failed(url, "Meta fetch failed / Blocked", file_lock)
+            await track_failed(url, "FAIL:meta_fetch — TikTok blocked or page unavailable", file_lock)
             return False
 
         v_id       = item["id"]
@@ -341,9 +407,6 @@ class TikTokScraperV5:
         post_ts    = human_ts(item.get("createTime"))
         log_prefix = f"{track_id} [@{author}]"
 
-        # ✅ FIX 1 & 2: sanitize_folder_name handles dots AND slashes
-        # dot  → underscore : fixes "Invalid arguments" (Mega rejects dots)
-        # slash → underscore : fixes "[Errno 2] No such file or directory"
         raw_folder  = f"@{author}_{cap_slug}_{v_id}"
         folder_name = sanitize_folder_name(raw_folder)
 
@@ -352,54 +415,65 @@ class TikTokScraperV5:
         v_path      = self.base_path / folder_name
         v_path.mkdir(parents=True, exist_ok=True)
 
-        # ── 1. JSON FILES ─────────────────────────────────────────────────
-        (v_path / f"{f_base}_RAW-meta_{f_ts_id}.json").write_text(
-            json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
+        # ── 1. JSON FILES ─────────────────────────────────────────────────────
+        # CHECKPOINT 2: File save
+        files_saved = True
+        try:
+            (v_path / f"{f_base}_RAW-meta_{f_ts_id}.json").write_text(
+                json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"{f_base}_meta_{f_ts_id}.json").write_text(
-            json.dumps({
-                "post_info": {
-                    "id":         v_id,
-                    "desc":       item.get("desc"),
-                    "createTime": item.get("createTime"),
-                    "posted_at":  post_ts
-                },
-                "stats":  item.get("statsV2", item.get("stats", {})),
-                "author": item.get("author", {}),
-                "music":  item.get("music", {})
-            }, indent=2, ensure_ascii=False), encoding="utf-8")
+            (v_path / f"{f_base}_meta_{f_ts_id}.json").write_text(
+                json.dumps({
+                    "post_info": {
+                        "id":         v_id,
+                        "desc":       item.get("desc"),
+                        "createTime": item.get("createTime"),
+                        "posted_at":  post_ts
+                    },
+                    "stats":  item.get("statsV2", item.get("stats", {})),
+                    "author": item.get("author", {}),
+                    "music":  item.get("music", {})
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"{f_base}_caption_{f_ts_id}.json").write_text(
-            json.dumps({
-                "username": author,
-                "post_url": url,
-                "caption":  item.get("desc", ""),
-                "hashtags": re.findall(r"#\w+", item.get("desc", ""))
-            }, indent=2, ensure_ascii=False), encoding="utf-8")
+            (v_path / f"{f_base}_caption_{f_ts_id}.json").write_text(
+                json.dumps({
+                    "username": author,
+                    "post_url": url,
+                    "caption":  item.get("desc", ""),
+                    "hashtags": re.findall(r"#\w+", item.get("desc", ""))
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        (v_path / f"{f_base}_account_{f_ts_id}.json").write_text(
-            json.dumps({
-                "author_details": item.get("author", {}),
-                "author_stats":   item.get("authorStats", {})
-            }, indent=2, ensure_ascii=False), encoding="utf-8")
+            (v_path / f"{f_base}_account_{f_ts_id}.json").write_text(
+                json.dumps({
+                    "author_details": item.get("author", {}),
+                    "author_stats":   item.get("authorStats", {})
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        logger.success(f"{log_prefix} 📝 Saved: RAW-meta, meta, caption, account")
+            logger.success(f"{log_prefix} 📝 Saved: RAW-meta, meta, caption, account")
+        except Exception as e:
+            logger.error(f"{log_prefix} ❌ JSON save failed: {e}")
+            await track_failed(url, f"FAIL:json_save — {e}", file_lock)
+            return False
 
-        # ── 2. MEDIA DOWNLOADS ────────────────────────────────────────────
+        # ── 2. MEDIA DOWNLOADS ────────────────────────────────────────────────
+        # CHECKPOINT 3: Media (video/thumbnail/audio/caption)
+        media_ok = True
         if self.cfg.get("download_media", True):
 
             # Avatar
             avatar_url = (item.get("author", {}).get("avatarLarger")
                           or item.get("author", {}).get("avatarMedium"))
             if avatar_url:
-                await self.download_file_httpx(
+                ok = await self.download_file_httpx(
                     avatar_url,
                     v_path / f"{f_base}_avatar_{f_ts_id}.jpg",
                     log_prefix, "Avatar")
+                if not ok:
+                    media_ok = False
 
             image_post = item.get("imagePost")
             if image_post and image_post.get("images"):
-                # ── CAROUSEL ─────────────────────────────────────────────
+                # ── CAROUSEL ────────────────────────────────────────────────
                 images = image_post.get("images", [])
                 logger.info(f"{log_prefix} 📸 Carousel mode ({len(images)} images).")
                 failed_indices = []
@@ -427,6 +501,7 @@ class TikTokScraperV5:
                         logger.success(f"{log_prefix} 📥 Carousel yt-dlp done.")
                     else:
                         logger.error(f"{log_prefix} ❌ Carousel yt-dlp fallback failed.")
+                        media_ok = False
 
                 music_data = item.get("music", {})
                 audio_url  = music_data.get("playUrl")
@@ -435,13 +510,15 @@ class TikTokScraperV5:
                 if isinstance(audio_url, list):
                     audio_url = audio_url[0]
                 if audio_url:
-                    await self.download_file_httpx(
+                    ok = await self.download_file_httpx(
                         audio_url,
                         v_path / f"{f_base}_audio_{f_ts_id}.mp3",
                         log_prefix, "Carousel Audio")
+                    if not ok:
+                        media_ok = False
 
             else:
-                # ── VIDEO ─────────────────────────────────────────────────
+                # ── VIDEO ────────────────────────────────────────────────────
                 video_data = item.get("video", {})
                 play_url   = None
 
@@ -487,6 +564,7 @@ class TikTokScraperV5:
                         await ensure_h264(video_path, log_prefix)
                     else:
                         logger.error(f"{log_prefix} ❌ Video download failed.")
+                        media_ok = False
 
                 music_data = item.get("music", {})
                 audio_url  = music_data.get("playUrl")
@@ -495,17 +573,49 @@ class TikTokScraperV5:
                 if isinstance(audio_url, list):
                     audio_url = audio_url[0]
                 if audio_url:
-                    await self.download_file_httpx(
+                    ok = await self.download_file_httpx(
                         audio_url,
                         v_path / f"{f_base}_audio_{f_ts_id}.mp3",
                         log_prefix, "Audio")
+                    if not ok:
+                        media_ok = False
 
-        # ── 3. COMMENTS ───────────────────────────────────────────────────
-        await self.fetch_comments(v_id, v_path, f_base, f_ts_id, log_prefix)
+        if not media_ok:
+            # Media partially failed — still try upload, but note it
+            logger.warning(f"{log_prefix} ⚠️ Some media files failed — proceeding to upload remaining.")
 
-        # ── 4. UPLOAD + TRACK ─────────────────────────────────────────────
-        await upload_to_mega(v_path, folder_name, log_prefix)
-        await track_success(url, file_lock)
+        # ── 3. COMMENTS ───────────────────────────────────────────────────────
+        # CHECKPOINT 4: Comments
+        comments_ok = await self.fetch_comments(v_id, v_path, f_base, f_ts_id, log_prefix)
+        if not comments_ok:
+            logger.warning(f"{log_prefix} ⚠️ Comments incomplete — proceeding to upload.")
+
+        # ── 4. UPLOAD + TRACK ─────────────────────────────────────────────────
+        # CHECKPOINT 5: Mega upload — only SUCCESS when Mega confirms
+        upload_ok = await upload_to_mega(v_path, folder_name, log_prefix)
+
+        if not upload_ok:
+            # Build a detailed failure note so retry is smart
+            fail_parts = []
+            if not media_ok:     fail_parts.append("media_partial")
+            if not comments_ok:  fail_parts.append("comments_incomplete")
+            fail_parts.append("FAIL:mega_upload")
+            await track_failed(url, " | ".join(fail_parts), file_lock)
+            return False
+
+        # All 5 checkpoints passed
+        if not media_ok or not comments_ok:
+            # Uploaded but with partial data — log warning in tracking
+            note = []
+            if not media_ok:    note.append("media_partial")
+            if not comments_ok: note.append("comments_incomplete")
+            _append_tracking("SUCCESS_PARTIAL", url, " | ".join(note))
+            async with file_lock:
+                with open(COMPLETED_FILE, "a", encoding="utf-8") as f:
+                    f.write(url + "\n")
+        else:
+            await track_success(url, file_lock)
+
         return True
 
     async def fetch_replies(self, video_id, comment_id, raw_list, clean_list, log_prefix):
@@ -570,7 +680,7 @@ class TikTokScraperV5:
                         headers=self.headers)
                     data = resp.json()
                 except:
-                    break
+                    return False  # comments fetch totally failed
 
             curr_batch = data.get("comments") or []
             if not curr_batch:
@@ -626,7 +736,7 @@ async def worker_task(scraper, url, index, total, sem_video, file_lock):
             return result
         except Exception as e:
             logger.error(f"Worker Error [{url}]: {e}")
-            await track_failed(url, str(e), file_lock)
+            await track_failed(url, f"FAIL:worker_exception — {e}", file_lock)
             return False
 
 # ---------------------------------------------------------
@@ -638,6 +748,15 @@ async def main():
         return
 
     all_urls = [l.strip() for l in open("links.txt", encoding="utf-8") if l.strip()]
+
+    # ── NEW: Hard limit — scraper will refuse to process more than 1700 links ──
+    hard_limit = CONFIG.get("hard_link_limit", 1700)
+    if len(all_urls) > hard_limit:
+        logger.warning(
+            f"⚠️ links.txt has {len(all_urls)} URLs — hard limit is {hard_limit}. "
+            f"Truncating to first {hard_limit}."
+        )
+        all_urls = all_urls[:hard_limit]
 
     if TOTAL_CHUNKS > 1:
         my_urls = [u for i, u in enumerate(all_urls) if i % TOTAL_CHUNKS == CHUNK_INDEX]
@@ -661,6 +780,8 @@ async def main():
 
     if not pending:
         logger.info("✅ All links already done.")
+        # Still build artifact even if nothing to do
+        await asyncio.to_thread(build_github_artifact)
         return
 
     logger.info(
@@ -712,8 +833,21 @@ async def main():
         f"   Skipped : {len(skipped)}\n{'='*50}"
     )
 
+    # Upload reports to Mega
     logger.info("📤 Uploading reports to Mega...")
     await upload_report_files()
+
+    # ── NEW: Build GitHub Actions artifact ZIP ─────────────────────────────────
+    # This ZIP contains report files + any leftover local data (failed uploads).
+    # In your workflow YAML add:
+    #   - uses: actions/upload-artifact@v4
+    #     with:
+    #       name: scraper-artifact-chunk-${{ matrix.chunk }}
+    #       path: "*.zip"
+    logger.info("📦 Building GitHub artifact ZIP...")
+    zip_path = await asyncio.to_thread(build_github_artifact)
+    if zip_path:
+        logger.success(f"📦 Artifact ready for GitHub Actions upload: {zip_path}")
 
 if __name__ == "__main__":
     try:
