@@ -1,0 +1,19 @@
+name: TikTok Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_name:
+        description: 'Batch folder name (leave empty = auto timestamp)'
+        required: false
+        default: ''
+      total_chunks:
+        description: 'Number of parallel workers (default: 20 for 10k links)'
+        required: false
+        default: '20'
+
+jobs:
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Ye main ka stub hai. 'Use workflow from' mein megacmd branch select karo."
