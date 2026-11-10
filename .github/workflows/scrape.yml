@@ -1,7 +1,7 @@
 name: TikTok Scraper
 
 on:
-  # Manual trigger
+  # Sirf Manual trigger
   workflow_dispatch:
     inputs:
       batch_name:
@@ -12,10 +12,6 @@ on:
         description: 'Number of parallel workers (default: 20 for 10k links)'
         required: false
         default: '20'
-
-  # Auto schedule — daily 2 AM Pakistan (9 PM UTC)
-  schedule:
-    - cron: '0 21 * * *'
 
 # ─────────────────────────────────────────────────────────────
 # STEP 1: Prepare — generate batch name, passed to all workers
@@ -98,25 +94,59 @@ jobs:
       - name: ⬆️ Update yt-dlp
         run: pip install -U yt-dlp
 
-      - name: 🎬 Install ffmpeg (for H.264 transcode fix)
-        run: sudo apt-get install -y ffmpeg
-
-      - name: ☁️ Install rclone
-        run: curl https://rclone.org/install.sh | sudo bash
-
-      - name: 🔧 Configure rclone
+      - name: 🎬 Update Repositories & Install ffmpeg
         run: |
-          mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG_CONTENT }}" > ~/.config/rclone/rclone.conf
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg --fix-missing
+
+      - name: ☁️ Install MEGAcmd
+        run: |
+          wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
+          sudo apt install ./megacmd-xUbuntu_22.04_amd64.deb -y
+
+      - name: 🔑 MEGA Login via Session Token
+        run: |
+          mega-cmd > /dev/null 2>&1 &
+          sleep 6
+          mega-login "${{ secrets.MEGA_SESSION_TOKEN }}"
+          mega-whoami
 
       - name: 🚀 Run Scraper (Worker ${{ matrix.chunk }})
         run: python scraper-fixed.py
 
-      # Is step mein ab saara data (ZIP file) GitHub par upload ho jayega
-      - name: 📦 Save All Scraped Data (Artifact)
+      - name: Upload Node Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-chunk-${{ matrix.chunk }}
+          name: nodereport-${{ matrix.chunk }}
+          path: NodeReport_*.json
+
+      - name: Upload Scraped Data ZIP (Artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-artifact-chunk-${{ matrix.chunk }}
           path: "*_artifact.zip"
-          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: Summary Node (Compiles Master Ledger)
+# ─────────────────────────────────────────────────────────────
+  summary_job:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all Node Reports
+        uses: actions/download-artifact@v4
+        with:
+          path: ./reports
+          pattern: nodereport-*
+          merge-multiple: true
+
+      - name: Move reports to root
+        run: mv ./reports/*.json ./ || true
+
+      - name: Run Summary Reporter
+        run: python summary_reporter_tiktok.py
