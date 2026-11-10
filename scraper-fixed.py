@@ -41,10 +41,8 @@ CONFIG = {
     "video_concurrency":      10,
     "comment_concurrency":    8,
     "max_comments_limit":     10000,
-    "rclone_remote":          "vfx",
-    "upload_concurrency":     1,    # ← FIX: 1 per pod × 15 pods × 2 transfers = 30 ≤ 32 Mega ceiling
-    # NEW: Hard limit — scraper will never process more than this many links
-    "hard_link_limit":        1700,
+    "upload_concurrency":     1,    
+    "hard_link_limit":        99999999000,
 }
 
 _upload_sem: asyncio.Semaphore = None
@@ -168,6 +166,25 @@ def build_github_artifact():
         logger.error(f"❌ ZIP build failed: {e}")
         return None
 
+def create_node_report(primary_acc, final_acc, status, files_processed):
+    """Generates the NodeReport.json for the Master Ledger summary job."""
+    report_file = f"NodeReport_{CHUNK_INDEX}.json"
+    data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "node": CHUNK_INDEX,
+        "batch_folder": BATCH_FOLDER_NAME,
+        "primary_assigned_acc": primary_acc,
+        "final_uploaded_acc": final_acc,
+        "status": status,
+        "files_count": files_processed
+    }
+    try:
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"📝 Node Report saved: {report_file}")
+    except Exception as e:
+        logger.error(f"❌ Failed to create node report: {e}")
+
 # ---------------------------------------------------------
 # 5. H.264 Codec Fix
 # ---------------------------------------------------------
@@ -252,70 +269,56 @@ def download_with_ytdlp(url, output_path):
         return False
 
 # ---------------------------------------------------------
-# 7. Rclone Upload
-#
-# SEAMLESS FIX — "Request over quota" root cause:
-#   Multiple pods each running rclone with --transfers=8 floods
-#   Mega's API session ceiling (32 connections max).
-#   15 pods × 1 upload_sem × 2 transfers = 30 ≤ 32  ✓
-#
-# --tpslimit 1  → max 1 API call/sec per rclone process
-# --tpslimit-burst 1 → no burst above that
-# This makes upload SLOW but STEADY and never quota-errors.
-#
-# FIX: Returns True/False so scrape_video can decide pass/fail.
-#      A link is only marked SUCCESS when Mega confirms receipt.
+# 7. MEGAcmd Upload (mega-put — single session, all nodes)
 # ---------------------------------------------------------
-async def upload_to_mega(local_folder_path, folder_name, log_prefix):
+async def upload_to_mega(local_folder_path, folder_name, log_prefix, my_accounts):
     global _upload_sem
     sem = _upload_sem or asyncio.Semaphore(CONFIG["upload_concurrency"])
     async with sem:
-        try:
-            remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/{folder_name}"
-            logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
-            cmd = [
-                "rclone", "copy", str(local_folder_path), remote_path,
-                "--transfers",         "2",     # FIX: 15 pods × 2 = 30 ≤ 32 Mega ceiling
-                "--checkers",          "1",     # FIX: minimal checker load
-                "--tpslimit",          "1",     # FIX: NEW — 1 API call/sec max (seamless, no quota burst)
-                "--tpslimit-burst",    "1",     # FIX: NEW — no burst allowed
-                "--retries",           "15",    # FIX: more retries for session drops
-                "--low-level-retries", "20",
-                "--timeout",           "120s",
-                "--contimeout",        "60s",
-                "--retries-sleep",     "5s",
-                "--log-level",         "ERROR",
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
-                return True   # ← FIX: signal success to caller — local data kept, no deletion
-            else:
-                logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
-                return False  # ← FIX: signal failure — link stays in failed.txt
-        except Exception as e:
-            logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
-            return False
+        remote_path = f"/{BATCH_FOLDER_NAME}/{folder_name}"
+        logger.info(f"{log_prefix} ☁️ mega-put → {remote_path}")
 
-async def upload_report_files():
+        # Retry loop — 3 attempts
+        for attempt in range(1, 4):
+            cmd = ["mega-put", "-c", str(local_folder_path), remote_path]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await proc.communicate()
+
+                if proc.returncode == 0:
+                    logger.success(f"{log_prefix} 🚀 mega-put Done → {remote_path}")
+                    return True, "MEGA_SESSION"
+                else:
+                    err = stderr.decode().strip()
+                    logger.warning(f"{log_prefix} ⚠️ Attempt {attempt}/3 failed: {err}")
+                    if attempt < 3:
+                        await asyncio.sleep(5 * attempt)  # 5s, 10s backoff
+            except Exception as e:
+                logger.error(f"{log_prefix} ❌ mega-put exception: {e}")
+                if attempt < 3:
+                    await asyncio.sleep(5)
+
+        logger.error(f"{log_prefix} ❌ mega-put failed after 3 attempts.")
+        return False, None
+
+async def upload_report_files(my_accounts):
+    remote_path = f"/{BATCH_FOLDER_NAME}/_Reports"
     for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]:
         if not os.path.exists(fpath):
             continue
         try:
-            remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/_Reports"
-            cmd = [
-                "rclone", "copy", fpath, remote_path,
-                "--tpslimit", "1", "--tpslimit-burst", "1",
-                "--log-level", "ERROR",
-            ]
+            cmd = ["mega-put", "-c", fpath, remote_path]
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
             await proc.communicate()
-            logger.success(f"✅ Report uploaded: {fpath}")
+            logger.success(f"✅ Report uploaded: {fpath} → {remote_path}")
         except Exception as e:
             logger.error(f"❌ Report upload failed ({fpath}): {e}")
 
@@ -381,7 +384,7 @@ class TikTokScraperV5:
         except:
             return None
 
-    async def scrape_video(self, url, index, total, file_lock):
+    async def scrape_video(self, url, index, total, file_lock, my_accounts):
         track_id  = f"[{index}/{total}]"
         logger.info(f"{'-'*50}\n{track_id} 🚀 URL: {url}")
 
@@ -390,7 +393,7 @@ class TikTokScraperV5:
         if not item:
             logger.error(f"{track_id} ❌ Meta not found or Blocked.")
             await track_failed(url, "FAIL:meta_fetch — TikTok blocked or page unavailable", file_lock)
-            return False
+            return False, None
 
         v_id       = item["id"]
         author     = item.get("author", {}).get("uniqueId", "unknown")
@@ -444,7 +447,7 @@ class TikTokScraperV5:
         except Exception as e:
             logger.error(f"{log_prefix} ❌ JSON save failed: {e}")
             await track_failed(url, f"FAIL:json_save — {e}", file_lock)
-            return False
+            return False, None
 
         # ── 2. MEDIA DOWNLOADS ────────────────────────────────────────────────
         # CHECKPOINT 3: Media (video/thumbnail/audio/caption)
@@ -582,17 +585,17 @@ class TikTokScraperV5:
             logger.warning(f"{log_prefix} ⚠️ Comments incomplete — proceeding to upload.")
 
         # ── 4. UPLOAD + TRACK ─────────────────────────────────────────────────
-        # CHECKPOINT 5: Mega upload — only SUCCESS when Mega confirms
-        upload_ok = await upload_to_mega(v_path, folder_name, log_prefix)
+        # CHECKPOINT 5: Mega upload — only SUCCESS when Mega confirms via fallback loop
+        upload_ok, acc_used = await upload_to_mega(v_path, folder_name, log_prefix, my_accounts)
 
         if not upload_ok:
             # Build a detailed failure note so retry is smart
             fail_parts = []
             if not media_ok:     fail_parts.append("media_partial")
             if not comments_ok:  fail_parts.append("comments_incomplete")
-            fail_parts.append("FAIL:mega_upload")
+            fail_parts.append("FAIL:mega_upload_all_fallbacks_exhausted")
             await track_failed(url, " | ".join(fail_parts), file_lock)
-            return False
+            return False, None
 
         # All 5 checkpoints passed
         if not media_ok or not comments_ok:
@@ -607,7 +610,7 @@ class TikTokScraperV5:
         else:
             await track_success(url, file_lock)
 
-        return True
+        return True, acc_used
 
     async def fetch_replies(self, video_id, comment_id, raw_list, clean_list, log_prefix):
         async with self.sem_comments:
@@ -719,12 +722,14 @@ class TikTokScraperV5:
 # ---------------------------------------------------------
 # 9. Worker
 # ---------------------------------------------------------
-async def worker_task(scraper, url, index, total, sem_video, file_lock):
+async def worker_task(scraper, url, index, total, sem_video, file_lock, my_accounts, results_tracker):
     async with sem_video:
         try:
-            result = await scraper.scrape_video(url, index, total, file_lock)
+            success, acc_used = await scraper.scrape_video(url, index, total, file_lock, my_accounts)
+            if success and acc_used:
+                results_tracker["final_acc"] = acc_used
             await asyncio.sleep(random.uniform(*CONFIG["delay_between_videos"]))
-            return result
+            return success
         except Exception as e:
             logger.error(f"Worker Error [{url}]: {e}")
             await track_failed(url, f"FAIL:worker_exception — {e}", file_lock)
@@ -738,10 +743,15 @@ async def main():
         logger.error("❌ links.txt not found!")
         return
 
+    # ── MEGAcmd single session — no account pool needed ──
+    my_accounts = ["MEGA_SESSION"]
+    primary_acc = "MEGA_SESSION"
+    logger.info("☁️ Upload mode: MEGAcmd single session token")
+
     all_urls = [l.strip() for l in open("links.txt", encoding="utf-8") if l.strip()]
 
-    # ── NEW: Hard limit — scraper will refuse to process more than 1700 links ──
-    hard_limit = CONFIG.get("hard_link_limit", 1700)
+    # Hard limit — scraper will refuse to process more than 17000 links
+    hard_limit = CONFIG.get("hard_link_limit", 17000)
     if len(all_urls) > hard_limit:
         logger.warning(
             f"⚠️ links.txt has {len(all_urls)} URLs — hard limit is {hard_limit}. "
@@ -771,8 +781,8 @@ async def main():
 
     if not pending:
         logger.info("✅ All links already done.")
-        # Still build artifact even if nothing to do
         await asyncio.to_thread(build_github_artifact)
+        create_node_report(primary_acc, primary_acc, "SKIPPED", 0)
         return
 
     logger.info(
@@ -782,7 +792,8 @@ async def main():
         f"   Retry failed   : {len(retry_set)}\n"
         f"   New            : {len(new_set)}\n"
         f"   Pending        : {len(pending)}\n"
-        f"   Concurrency    : {CONFIG['video_concurrency']} videos parallel"
+        f"   Concurrency    : {CONFIG['video_concurrency']} videos parallel\n"
+        f"   Target Accounts: {my_accounts}"
     )
 
     file_lock = asyncio.Lock()
@@ -793,10 +804,13 @@ async def main():
     _upload_sem = asyncio.Semaphore(CONFIG["upload_concurrency"])
     sem_video   = asyncio.Semaphore(CONFIG["video_concurrency"])
     scraper     = TikTokScraperV5(CONFIG)
+    
+    # Track which account finally succeeded for the Ledger
+    results_tracker = {"final_acc": primary_acc}
 
     try:
         tasks = [
-            worker_task(scraper, url, i + 1, len(pending), sem_video, file_lock)
+            worker_task(scraper, url, i + 1, len(pending), sem_video, file_lock, my_accounts, results_tracker)
             for i, url in enumerate(pending)
         ]
         await asyncio.gather(*tasks)
@@ -826,19 +840,16 @@ async def main():
 
     # Upload reports to Mega
     logger.info("📤 Uploading reports to Mega...")
-    await upload_report_files()
+    await upload_report_files(my_accounts)
 
-    # ── NEW: Build GitHub Actions artifact ZIP ─────────────────────────────────
-    # This ZIP contains report files + any leftover local data (failed uploads).
-    # In your workflow YAML add:
-    #   - uses: actions/upload-artifact@v4
-    #     with:
-    #       name: scraper-artifact-chunk-${{ matrix.chunk }}
-    #       path: "*.zip"
     logger.info("📦 Building GitHub artifact ZIP...")
     zip_path = await asyncio.to_thread(build_github_artifact)
     if zip_path:
         logger.success(f"📦 Artifact ready for GitHub Actions upload: {zip_path}")
+        
+    # Generate CSV Summary Node Report
+    status = "SUCCESS" if len(done_final) > 0 else "FAILED"
+    create_node_report(primary_acc, results_tracker["final_acc"], status, len(done_final))
 
 if __name__ == "__main__":
     try:
